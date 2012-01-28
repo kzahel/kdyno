@@ -1,0 +1,11 @@
+basic asynchronous dynamodb api layer
+
+handles the new aws hmac signature and session token stuff
+
+basic usage:
+
+from kdyno.kdyno import KDyno
+db = KDyno(AWS_ACCESS_KEY, AWS_SECRET_KEY)
+@tornado.gen.engine
+def do_thing():
+    yield gen.Task( db.do_request, 'DescribeTable', {'TableName':'FOO'} )
