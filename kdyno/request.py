@@ -214,3 +214,4 @@ class JSONResponse(object):
         if 'debug' in options and options.debug:
             self.body = body
         self.attributes = json.loads(body)
+

@@ -9,6 +9,18 @@ from request import AWSRequest, parse_headers
 from request import Response, JSONResponse
 from util import HmacAuthV3HTTPHandler
 import pdb
+import tornado.ioloop
+import time
+def asyncsleep(t, callback=None):
+    logging.info('sleeping %s' % t)
+    tornado.ioloop.IOLoop.instance().add_timeout( time.time() + t, callback )
+
+class ErrorResponse(object):
+    def __init__(self, message):
+        self.code = 599
+        self.error = True
+        self.headers = None
+        self.message = message
 
 class Request(object):
     ServiceName = 'DynamoDB'
@@ -35,9 +47,10 @@ class STS(object):
         s = socket.socket(socket.AF_INET, socket.SOCK_STREAM, 0)
         stream = tornado.iostream.SSLIOStream(s)
         stream._always_callback = True # get callbacks on stream.connect
-        yield gen.Task( stream.connect, (self.DefaultRegionEndpoint,443) )
+        addr = (self.DefaultRegionEndpoint,443)
+        yield gen.Task( stream.connect, addr )
         if stream.error:
-            callback(False)
+            callback(ErrorResponse('error connecting to %s to get token' % str(addr) ) )
             raise StopIteration
 
         request = AWSRequest('POST', self.DefaultRegionEndpoint, {'Action':'GetSessionToken'})
@@ -49,17 +62,29 @@ class STS(object):
         #logging.info('writing %s' % towrite)
         yield gen.Task( stream.write, towrite )
         rawheaders = yield gen.Task( stream.read_until, '\r\n\r\n' )
+        if not rawheaders:
+            logging.error('read until headers returned null, likely socket closed...')
+            callback( ErrorResponse('socket closed') )
+            raise StopIteration
+
         code, headers = parse_headers(rawheaders)
         if code != 200:
             logging.error('got error response %s, %s' % (code, headers))
+            callback( ErrorResponse('non 200 response %s' % code ) )
+            stream.close()
+            raise StopIteration
         if 'Content-Length' in headers:
             body = yield gen.Task( stream.read_bytes, int(headers['Content-Length']) )
+            if not body:
+                logging.error('conn closed reading for body?')
+                callback( ErrorResponse('socket closed') )
+                raise StopIteration
             #logging.info('got body %s' % body)
             response = Response( code, headers, body )
             callback( response )
         else:
             logging.error('chunked encoding response?')
-            pdb.set_trace()
+            callback( ErrorResponse('unable to parse chunked encoding') )
 
 
 class KDyno(STS, HmacAuthV3HTTPHandler):
@@ -95,13 +120,18 @@ class KDyno(STS, HmacAuthV3HTTPHandler):
                 stream = tornado.iostream.IOStream(s)
                 addr = (self.db, 80)
             stream._current_request = None
+            stream._always_callback = True
             stream.set_close_callback(functools.partial(self.on_close, stream))
             #logging.info('connecting to %s' % self.db)
             yield gen.Task( stream.connect, addr )
-            #logging.info('connected')
-            stream._debug_info = 'ksdb stream'
-            self.streams[ stream ] = None
-            callback(stream)
+            if stream.error:
+                logging.error('error in connecting...')
+                callback(ErrorResponse('error connecting to %s' % str(addr)))
+            else:
+                #logging.info('connected')
+                stream._debug_info = 'ksdb stream'
+                self.streams[ stream ] = None
+                callback(stream)
 
     def remove_connection(self, stream):
         if not stream.closed(): stream.close()
@@ -114,20 +144,86 @@ class KDyno(STS, HmacAuthV3HTTPHandler):
             # likely "read error" on socket iostream.py
             if stream._current_request:
                 logging.error('db connection closed while had _current_request')
+                if hasattr(stream._current_request,'callback') and stream._current_request.callback:
+                    stream._current_request.callback( ErrorResponse('connection closed') )
         self.remove_connection(stream)
+
+    @gen.engine
+    def create_table(self, name, hash_key, hash_key_type=None, range_key=None, range_key_type=None, read_units=3, write_units=5, callback=None):
+        hash_key_type = 'S' or hash_key_type
+
+        data = { 'TableName': name,
+                 'KeySchema': { 'HashKeyElement': { 'AttributeName': hash_key, 'AttributeType': hash_key_type } },
+                 'ProvisionedThroughput': { 'ReadCapacityUnits': read_units, 'WriteCapacityUnits': write_units } }
+
+        range_key_type = 'S' or range_key_type
+        if range_key:
+            data['KeySchema']['RangeKeyElement'] = { 'AttributeName': range_key, 'AttributeType': range_key_type }
+
+        resp = yield gen.Task( self.do_request, 'CreateTable', data )
+        callback(resp)
+
+    @gen.engine
+    def describe_table(self, name, callback):
+        resp = yield gen.Task( self.do_request, 'DescribeTable', {'TableName': name} )
+        callback(resp)
+
+    @gen.engine
+    def delete_table(self, name, callback):
+        resp = yield gen.Task( self.do_request, 'DeleteTable', {'TableName': name} )
+        callback(resp)
+
+    @gen.engine
+    def list_tables(self, start_name=None, limit=None, callback=None):
+        data = {}
+        if limit:
+            data['Limit'] = limit
+        if start_name:
+            data['ExclusiveTableStartName'] = start_name
+        resp = yield gen.Task( self.do_request, 'ListTables', data )
+        callback(resp)
+
+    @gen.engine
+    def get_item(self, table_name, hash_key, hash_key_type=None, range_key=None, range_key_type=None, attrs=None, consistent=False, callback=None):
+        hash_key_type = 'S' or hash_key_type
+        data = { 'TableName': table_name,
+                 'Key': { 'HashKeyElement': { hash_key_type: hash_key } }
+                 }
+        if range_key:
+            range_key_type = 'S' or range_key_type
+            data['Key']['RangeKeyElement'] = { range_key_type: range_key }
+        if consistent:
+            data['ConsistentRead'] = consistent
+        if attrs:
+            data['AttributesToGet'] = attrs
+        resp = yield gen.Task( self.do_request, 'GetItem', data )
+        callback(resp)
+
+    @gen.engine
+    def put_item(self, table_name, item, expected=None, callback=None):
+        data = { 'TableName': table_name,
+                 'Item': item }
+        if expected:
+            data['Expected'] = expected
+        resp = yield gen.Task( self.do_request, 'PutItem', data )
+        callback(resp)
 
     @gen.engine
     def do_request(self, target, params, callback=None):
         if not self.session_token:
             response = yield gen.Task( self.get_session_token )
-            if not response or response.error:
-                callback(Exception('failed to retreive token'))
+            if response.error:
+                callback(response)
                 raise StopIteration
             self.session_token = response.meta
             self.update_secret( str(response.meta['SecretAccessKey']) )
+            logging.info('got session token')
 
-        logging.info('got session token')
         stream = yield gen.Task( self.get_stream )
+        if stream.error:
+            logging.error('error getting stream %s' % stream)
+            callback( ErrorResponse('unable to get stream') )
+            raise StopIteration
         request = AWSRequest('POST', self.DefaultHost, params)
         body = request.to_json_postdata()
         request.body = body
@@ -135,8 +231,23 @@ class KDyno(STS, HmacAuthV3HTTPHandler):
         self.add_auth(request, security_token = self.session_token['SessionToken'], access_key = self.session_token['AccessKeyId'])
         request.headers['Content-Length'] = str(len(body))
         towrite = request.make_request_headers() + body
+        stream._current_request = request
+        #request.callback = callback # we're handling error states ourselves
+
+        logging.info('writing to stream..')
         yield gen.Task( stream.write, towrite )
+        if stream.error:
+            logging.error('connection died while writing to it')
+            callback( ErrorResponse('connection died while writing') )
+            raise StopIteration
+        yield gen.Task( asyncsleep, 10 )
+        logging.info('reading from stream')
         rawheaders = yield gen.Task( stream.read_until, '\r\n\r\n' )
+        if not rawheaders or stream.error:
+            logging.error('connection seems to have closed..')
+            callback( ErrorResponse('connection closed on reading for headers') )
+            raise StopIteration
+
         code, headers = parse_headers(rawheaders)
         if code != 200:
             logging.error('got error response %s, %s' % (code, headers))
@@ -144,9 +255,18 @@ class KDyno(STS, HmacAuthV3HTTPHandler):
             self.session_token = None
         if 'Content-Length' in headers:
             body = yield gen.Task( stream.read_bytes, int(headers['Content-Length']) )
+            if not body:
+                callback( ErrorResponse('connection closed on reading for body') )
+                raise StopIteration
+            request.callback = None
+            stream._current_request = None
             response = JSONResponse( code, headers, body )
             logging.info('got response :%s, %s' % (response, response.attributes))
             callback( response )
         else:
             logging.error('chunked encoding response?')
-            pdb.set_trace()
+            callback( ErrorResponse('no content length header') )
+
+        if len(self.streams) > 25:
+            logging.warn('too many db connections %s -- closing one' % len(self.streams))
+            self.remove_connection(stream)
