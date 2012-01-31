@@ -215,3 +215,4 @@ class JSONResponse(object):
             self.body = body
         self.attributes = json.loads(body)
 
+

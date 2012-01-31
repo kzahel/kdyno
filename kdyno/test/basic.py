@@ -73,9 +73,30 @@ def test_items():
         raise StopIteration
     #pdb.set_trace()
     #
+
+@gen.engine
+def create_app_tables():
+    resp = yield gen.Task( db.create_table, 'users_dev', 'username' )
+    resp = yield gen.Task( db.create_table, 'users_cid_dev', 'cid' )
+
+@gen.engine
+def delete_app_tables():
+    resp = yield gen.Task( db.delete_table, 'users_dev' )
+    resp = yield gen.Task( db.delete_table, 'users_cid_dev' )
     
+
+@gen.engine
+def list_tables():
+    resp = yield gen.Task( db.list_tables )
+    logging.info('resp %s' % resp.attributes)
 
 #ioloop.add_callback( basic )
 #ioloop.add_callback( test_tables )
-ioloop.add_callback( test_items )
+#ioloop.add_callback( test_items )
+ioloop.add_callback( list_tables )
+#ioloop.add_callback( create_app_tables )
+#ioloop.add_callback( delete_app_tables )
+
+
+
 ioloop.start()

@@ -11,6 +11,8 @@ from util import HmacAuthV3HTTPHandler
 import pdb
 import tornado.ioloop
 import time
+from tornado.options import options
+
 def asyncsleep(t, callback=None):
     logging.info('sleeping %s' % t)
     tornado.ioloop.IOLoop.instance().add_timeout( time.time() + t, callback )
@@ -85,13 +87,49 @@ class STS(object):
         else:
             logging.error('chunked encoding response?')
             callback( ErrorResponse('unable to parse chunked encoding') )
+        if not stream.closed(): stream.close()
+
+class DynamoTable(object):
+    def __init__(self, db, name):
+        ''' convenience thing '''
+        self.db = db
+        self.name = name
+
+    def get(self, key, callback=None):
+        self.db.get_item( self.name, key, callback=callback )
+
+    def put(self, key, attrs, callback=None):
+        dattrs = {}
+        for k,v in attrs.items():
+            dattrs[k] = {'S':str(v)}
+
+        self.db.put_item( self.name, dattrs, callback=callback)
+
+    def delete(self, key, key_type=None, callback=None):
+        key_type = key_type or 'S'
+        dkey = { 'HashKeyElement': { key_type: key } }
+        self.db.delete_item( self.name, dkey, callback=callback )
+
+    @gen.engine
+    def get_by_attribute(self, k, v, callback=None):
+        if k == 'cid':
+            if options.users_database == 'users':
+                table_name = 'users_cid'
+            else:
+                table_name = 'users_cid_dev'
+        result = yield gen.Task( self.db.get_item, table_name, v )
+        if result.code == 200 and 'Item' in result.attributes:
+            username = result.attributes['Item']['username'].values()[0]
+            callback( [ {'username':username} ] )
+        else:
+            callback( None )
 
 
 class KDyno(STS, HmacAuthV3HTTPHandler):
 
     DefaultHost = 'dynamodb.us-east-1.amazonaws.com'
 
-    def __init__(self, aws_key, aws_secret, db=None, secure=True, name=None):
+    def __init__(self, aws_key, aws_secret, db=None, secure=False, name=None):
         self.db = db or self.DefaultHost
         self.secure = secure
         self.aws_key = aws_key
@@ -100,6 +138,9 @@ class KDyno(STS, HmacAuthV3HTTPHandler):
         self.name = name
         self.session_token = None
         HmacAuthV3HTTPHandler.__init__(self, self.db, None, self.aws_secret)
+
+    def get_domain(self, name):
+        return DynamoTable(self, name)
 
     @gen.engine
     def get_stream(self, callback):
@@ -129,7 +170,7 @@ class KDyno(STS, HmacAuthV3HTTPHandler):
                 callback(ErrorResponse('error connecting to %s' % str(addr)))
             else:
                 #logging.info('connected')
-                stream._debug_info = 'ksdb stream'
+                stream._debug_info = 'kdyno stream'
                 self.streams[ stream ] = None
                 callback(stream)
 
@@ -209,7 +250,18 @@ class KDyno(STS, HmacAuthV3HTTPHandler):
         callback(resp)
 
     @gen.engine
+    def delete_item(self, table_name, key, expected=None, callback=None):
+        data = { 'TableName': table_name,
+                 'Key': key }
+        if expected:
+            data['Expected'] = expected
+        resp = yield gen.Task( self.do_request, 'DeleteItem', data )
+        callback(resp)
+
+    @gen.engine
     def do_request(self, target, params, callback=None):
+        if options.verbose > 1:
+            logging.info('do request %s %s' % (target, params))
         if not self.session_token:
             response = yield gen.Task( self.get_session_token )
             if response.error:
@@ -234,14 +286,14 @@ class KDyno(STS, HmacAuthV3HTTPHandler):
         stream._current_request = request
         #request.callback = callback # we're handling error states ourselves
 
-        logging.info('writing to stream..')
+        #logging.info('writing to stream..')
         yield gen.Task( stream.write, towrite )
         if stream.error:
             logging.error('connection died while writing to it')
             callback( ErrorResponse('connection died while writing') )
             raise StopIteration
-        yield gen.Task( asyncsleep, 10 )
-        logging.info('reading from stream')
+        #yield gen.Task( asyncsleep, 10 )# for testing
+        #logging.info('reading from stream')
         rawheaders = yield gen.Task( stream.read_until, '\r\n\r\n' )
         if not rawheaders or stream.error:
             logging.error('connection seems to have closed..')
@@ -255,13 +307,15 @@ class KDyno(STS, HmacAuthV3HTTPHandler):
             self.session_token = None
         if 'Content-Length' in headers:
             body = yield gen.Task( stream.read_bytes, int(headers['Content-Length']) )
+            #logging.info('GOT BODY %s' % body)
             if not body:
                 callback( ErrorResponse('connection closed on reading for body') )
                 raise StopIteration
             request.callback = None
             stream._current_request = None
             response = JSONResponse( code, headers, body )
-            logging.info('got response :%s, %s' % (response, response.attributes))
+            if options.verbose > 1:
+                logging.info('got response :%s, %s' % (response, response.attributes))
             callback( response )
         else:
             logging.error('chunked encoding response?')
