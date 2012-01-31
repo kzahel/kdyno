@@ -23,6 +23,7 @@ class ErrorResponse(object):
         self.error = True
         self.headers = None
         self.message = message
+        self.attributes = None
 
 class Request(object):
     ServiceName = 'DynamoDB'
@@ -44,7 +45,7 @@ class STS(object):
     APIVersion = '2011-06-15'
 
     @gen.engine
-    def get_session_token(self, callback=None):
+    def get_session_token(self, duration_seconds=None, callback=None):
         logging.info('retreiving session token')
         s = socket.socket(socket.AF_INET, socket.SOCK_STREAM, 0)
         stream = tornado.iostream.SSLIOStream(s)
@@ -55,7 +56,10 @@ class STS(object):
             callback(ErrorResponse('error connecting to %s to get token' % str(addr) ) )
             raise StopIteration
 
-        request = AWSRequest('POST', self.DefaultRegionEndpoint, {'Action':'GetSessionToken'})
+        data = {'Action':'GetSessionToken'}
+        if duration_seconds:
+            data['DurationSeconds'] = duration_seconds
+        request = AWSRequest('POST', self.DefaultRegionEndpoint, data)
         request.set_parameter('Version', self.APIVersion)
         request.sign_request(self.aws_key, self.aws_secret)
         body = request.to_postdata()
@@ -71,7 +75,7 @@ class STS(object):
 
         code, headers = parse_headers(rawheaders)
         if code != 200:
-            logging.error('got error response %s, %s' % (code, headers))
+            logging.error('get token: got error response %s, %s' % (code, headers))
             callback( ErrorResponse('non 200 response %s' % code ) )
             stream.close()
             raise StopIteration
@@ -260,10 +264,10 @@ class KDyno(STS, HmacAuthV3HTTPHandler):
 
     @gen.engine
     def do_request(self, target, params, callback=None):
-        if options.verbose > 1:
-            logging.info('do request %s %s' % (target, params))
+        if options.verbose > 0:
+            logging.info('request %s %s' % (target, params))
         if not self.session_token:
-            response = yield gen.Task( self.get_session_token )
+            response = yield gen.Task( self.get_session_token, duration_seconds=3600 )
             if response.error:
                 callback(response)
                 raise StopIteration
