@@ -280,6 +280,13 @@ class KDyno(STS, HmacAuthV3HTTPHandler):
         body = request.to_json_postdata()
         request.body = body
         request.headers['X-Amz-Target'] = 'DynamoDB_20111205.%s' % target
+
+        if not self.session_token:
+            err = 'session token was invalidated while getting a db connection'
+            logging.error(err)
+            callback( ErrorResponse(err) )
+            raise StopIteration
+
         self.add_auth(request, security_token = self.session_token['SessionToken'], access_key = self.session_token['AccessKeyId'])
         request.headers['Content-Length'] = str(len(body))
         towrite = request.make_request_headers() + body
@@ -301,12 +308,10 @@ class KDyno(STS, HmacAuthV3HTTPHandler):
             raise StopIteration
 
         code, headers = parse_headers(rawheaders)
-        if code != 200:
-            logging.error('got error response %s, %s' % (code, headers))
-            # detect for invalid expired session token and expire it...
-            self.session_token = None
         if 'Content-Length' in headers:
             body = yield gen.Task( stream.read_bytes, int(headers['Content-Length']) )
+            if code != 200:
+                logging.error('got error response %s, %s, %s' % (code, headers, body))
             #logging.info('GOT BODY %s' % body)
             if not body:
                 callback( ErrorResponse('connection closed on reading for body') )
@@ -314,8 +319,12 @@ class KDyno(STS, HmacAuthV3HTTPHandler):
             request.callback = None
             stream._current_request = None
             response = JSONResponse( code, headers, body )
-            if options.verbose > 1:
+            if options.verbose > 1 and code == 200:
                 logging.info('got response :%s, %s' % (response, response.attributes))
+
+            if code == 400 and response.attributes and '__type' in response.attributes and response.attributes['__type'].endswith('ExpiredTokenException'):
+                self.session_token = None
+
             callback( response )
         else:
             logging.error('chunked encoding response?')
