@@ -263,7 +263,7 @@ class KDyno(STS, HmacAuthV3HTTPHandler):
         callback(resp)
 
     @gen.engine
-    def do_request(self, target, params, callback=None):
+    def do_request(self, target, params, retry_if_invalid_stream=True, retry_on_expired_token=True, callback=None):
         if options.verbose > 0:
             logging.info('request %s %s' % (target, params))
         if not self.session_token:
@@ -275,41 +275,48 @@ class KDyno(STS, HmacAuthV3HTTPHandler):
             self.update_secret( str(response.meta['SecretAccessKey']) )
             logging.info('got session token')
 
-        stream = yield gen.Task( self.get_stream )
-        if stream.error:
-            logging.error('error getting stream %s' % stream)
-            callback( ErrorResponse('unable to get stream') )
-            raise StopIteration
-        request = AWSRequest('POST', self.DefaultHost, params)
-        body = request.to_json_postdata()
-        request.body = body
-        request.headers['X-Amz-Target'] = 'DynamoDB_20111205.%s' % target
+        stream_tries = 0
+        while stream_tries <= 2:
+            stream_tries += 1
+            stream = yield gen.Task( self.get_stream )
+            if stream.error:
+                logging.error('error getting stream %s' % stream)
+                callback( ErrorResponse('unable to get stream') )
+                raise StopIteration
+            request = AWSRequest('POST', self.DefaultHost, params)
+            body = request.to_json_postdata()
+            request.body = body
+            request.headers['X-Amz-Target'] = 'DynamoDB_20111205.%s' % target
 
-        if not self.session_token:
-            err = 'session token was invalidated while getting a db connection'
-            logging.error(err)
-            callback( ErrorResponse(err) )
-            raise StopIteration
+            if not self.session_token:
+                err = 'session token was invalidated while getting a db connection'
+                logging.error(err)
+                callback( ErrorResponse(err) )
+                raise StopIteration
 
-        self.add_auth(request, security_token = self.session_token['SessionToken'], access_key = self.session_token['AccessKeyId'])
-        request.headers['Content-Length'] = str(len(body))
-        towrite = request.make_request_headers() + body
-        stream._current_request = request
-        #request.callback = callback # we're handling error states ourselves
+            self.add_auth(request, security_token = self.session_token['SessionToken'], access_key = self.session_token['AccessKeyId'])
+            request.headers['Content-Length'] = str(len(body))
+            towrite = request.make_request_headers() + body
+            stream._current_request = request
+            #request.callback = callback # we're handling error states ourselves
 
-        #logging.info('writing to stream..')
-        yield gen.Task( stream.write, towrite )
-        if stream.error:
-            logging.error('connection died while writing to it')
-            callback( ErrorResponse('connection died while writing') )
-            raise StopIteration
-        #yield gen.Task( asyncsleep, 10 )# for testing
-        #logging.info('reading from stream')
-        rawheaders = yield gen.Task( stream.read_until, '\r\n\r\n' )
-        if not rawheaders or stream.error:
-            logging.error('connection seems to have closed..')
-            callback( ErrorResponse('connection closed on reading for headers') )
-            raise StopIteration
+            #logging.info('writing to stream..')
+            yield gen.Task( stream.write, towrite )
+            if stream.error:
+                logging.error('connection died while writing to it')
+                callback( ErrorResponse('connection died while writing') )
+                raise StopIteration
+            #yield gen.Task( asyncsleep, 10 )# for testing
+            #logging.info('reading from stream')
+            rawheaders = yield gen.Task( stream.read_until, '\r\n\r\n' )
+            if not rawheaders or stream.error:
+                logging.error('connection seems to have closed..')
+                # if error is read error connection reset by peer, the request probably never made it in... (dead stream)...
+                # if so, perhaps re-try.
+                #callback( ErrorResponse('connection closed on reading for headers') )
+                #raise StopIteration
+            else:
+                break
 
         code, headers = parse_headers(rawheaders)
         if 'Content-Length' in headers:
@@ -328,6 +335,11 @@ class KDyno(STS, HmacAuthV3HTTPHandler):
 
             if code == 400 and response.attributes and '__type' in response.attributes and response.attributes['__type'].endswith('ExpiredTokenException'):
                 self.session_token = None
+                # re-do this request...
+                if retry_on_expired_token:
+                    result = yield gen.Task( self.do_request, target, params, retry_if_invalid_stream=True, retry_on_expired_token=False )
+                    callback(result)
+                    raise StopIteration
 
             callback( response )
         else:
