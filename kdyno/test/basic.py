@@ -90,10 +90,16 @@ def list_tables():
     resp = yield gen.Task( db.list_tables )
     logging.info('resp %s' % resp.attributes)
 
+@gen.engine
+def get_item():
+    resp = yield gen.Task( db.get_item, 'users', 'kyleworkprod2' )
+    import pdb; pdb.set_trace()
+
 #ioloop.add_callback( basic )
 #ioloop.add_callback( test_tables )
 #ioloop.add_callback( test_items )
-ioloop.add_callback( list_tables )
+#ioloop.add_callback( list_tables )
+ioloop.add_callback( get_item )
 #ioloop.add_callback( create_app_tables )
 #ioloop.add_callback( delete_app_tables )
 

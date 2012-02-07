@@ -46,7 +46,7 @@ class STS(object):
 
     @gen.engine
     def get_session_token(self, duration_seconds=None, callback=None):
-        logging.info('retreiving session token')
+        #logging.info('retreiving session token')
         s = socket.socket(socket.AF_INET, socket.SOCK_STREAM, 0)
         stream = tornado.iostream.SSLIOStream(s)
         stream._always_callback = True # get callbacks on stream.connect
@@ -125,6 +125,8 @@ class DynamoTable(object):
         if result.code == 200 and 'Item' in result.attributes:
             username = result.attributes['Item']['username'].values()[0]
             callback( [ {'username':username} ] )
+        elif result.code == 200:
+            callback( [] )
         else:
             callback( None )
 
@@ -264,7 +266,7 @@ class KDyno(STS, HmacAuthV3HTTPHandler):
 
     @gen.engine
     def do_request(self, target, params, retry_if_invalid_stream=True, retry_on_expired_token=True, callback=None):
-        if options.verbose > 0:
+        if 'verbose' in options and options.verbose > 0:
             logging.info('request %s %s' % (target, params))
         if not self.session_token:
             response = yield gen.Task( self.get_session_token, duration_seconds=3600 )
@@ -273,7 +275,7 @@ class KDyno(STS, HmacAuthV3HTTPHandler):
                 raise StopIteration
             self.session_token = response.meta
             self.update_secret( str(response.meta['SecretAccessKey']) )
-            logging.info('got session token')
+            #logging.info('got session token')
 
         stream_tries = 0
         while stream_tries <= 2:
@@ -330,7 +332,7 @@ class KDyno(STS, HmacAuthV3HTTPHandler):
             request.callback = None
             stream._current_request = None
             response = JSONResponse( code, headers, body )
-            if options.verbose > 1 and code == 200:
+            if 'verbose' in options and options.verbose > 1 and code == 200:
                 logging.info('got response :%s, %s' % (response, response.attributes))
 
             if code == 400 and response.attributes and '__type' in response.attributes and response.attributes['__type'].endswith('ExpiredTokenException'):
