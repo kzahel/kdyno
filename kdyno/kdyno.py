@@ -152,16 +152,17 @@ class KDyno(STS, HmacAuthV3HTTPHandler):
         self.usage = 0
         HmacAuthV3HTTPHandler.__init__(self, self.db, None, self.aws_secret)
 
-    def register_usage(self, target, amount):
-        if target in ['PutItem', 'UpdateItem', 'DeleteItem']:
-            target = 'write'
-        elif target in ['GetItem','BatchGetItem','Query','Scan']:
-            target = 'read'
+    def register_usage(self, target, params, amount):
+        if 'TableName' in params:
+            if target in ['PutItem', 'UpdateItem', 'DeleteItem']:
+                target = 'write.%s' % params['TableName']
+            elif target in ['GetItem','BatchGetItem','Query','Scan']:
+                target = 'read.%s' % params['TableName']
 
-        self.usage += amount
-        if self.Statsd:
-            self.Statsd.increment('dynamo.%s' % target)
-        #logging.info('dynamo %s usage %s' % (target, amount))
+            self.usage += amount
+            if self.Statsd:
+                self.Statsd.increment('dynamo.%s' % target)
+            #logging.info('dynamo %s usage %s' % (target, amount))
 
     def get_domain(self, name):
         return DynamoTable(self, name)
@@ -360,7 +361,7 @@ class KDyno(STS, HmacAuthV3HTTPHandler):
             stream._current_request = None
             response = JSONResponse( code, headers, body )
             if 'ConsumedCapacityUnits' in response.attributes:
-                self.register_usage( target, response.attributes['ConsumedCapacityUnits'] )
+                self.register_usage( target, params, response.attributes['ConsumedCapacityUnits'] )
             if 'verbose' in options and options.verbose > 1 and code == 200:
                 logging.info('got response :%s, %s' % (response, response.attributes))
 
