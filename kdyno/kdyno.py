@@ -105,7 +105,13 @@ class DynamoTable(object):
     def put(self, key, attrs, callback=None):
         dattrs = {}
         for k,v in attrs.items():
-            dattrs[k] = {'S':str(v)}
+            try:
+                sv = str(v)
+            except:
+                logging.error('non ascii database value %s' % [v])
+                callback( ErrorResponse('non ascii') )
+                return
+            dattrs[k] = {'S':sv}
 
         self.db.put_item( self.name, dattrs, callback=callback)
 
@@ -132,7 +138,7 @@ class DynamoTable(object):
 
 
 class KDyno(STS, HmacAuthV3HTTPHandler):
-
+    Statsd = None
     DefaultHost = 'dynamodb.us-east-1.amazonaws.com'
 
     def __init__(self, aws_key, aws_secret, db=None, secure=False, name=None):
@@ -143,7 +149,19 @@ class KDyno(STS, HmacAuthV3HTTPHandler):
         self.streams = {}
         self.name = name
         self.session_token = None
+        self.usage = 0
         HmacAuthV3HTTPHandler.__init__(self, self.db, None, self.aws_secret)
+
+    def register_usage(self, target, amount):
+        if target in ['PutItem', 'UpdateItem', 'DeleteItem']:
+            target = 'write'
+        elif target in ['GetItem','BatchGetItem','Query','Scan']:
+            target = 'read'
+
+        self.usage += amount
+        if self.Statsd:
+            self.Statsd.increment('dynamo.%s' % target)
+        #logging.info('dynamo %s usage %s' % (target, amount))
 
     def get_domain(self, name):
         return DynamoTable(self, name)
@@ -154,11 +172,13 @@ class KDyno(STS, HmacAuthV3HTTPHandler):
         for stream,v in self.streams.iteritems():
             if not stream._connecting and not stream._current_request and not stream.closed():
                 found = True
-                logging.info('%sfound usable db connection (%s total)' % (self.name+' ' if self.name else '', len(self.streams)))
+                if 'verbose' in options and options.verbose > 1:
+                    logging.info('%sfound usable db connection (%s total)' % (self.name+' ' if self.name else '', len(self.streams)))
                 callback(stream)
                 break
         if not found:
-            logging.info('%screating new db connection' % (self.name+' ' if self.name else ''))
+            if 'verbose' in options and options.verbose > 1:
+                logging.info('%screating new db connection' % (self.name+' ' if self.name else ''))
             s = socket.socket(socket.AF_INET, socket.SOCK_STREAM, 0)
             if self.secure:
                 stream = tornado.iostream.SSLIOStream(s)
@@ -186,7 +206,8 @@ class KDyno(STS, HmacAuthV3HTTPHandler):
             del self.streams[stream]
 
     def on_close(self, stream):
-        logging.warn('db connection close')
+        if 'verbose' in options and options.verbose > 1:
+            logging.warn('db connection close')
         if stream._current_request:
             # likely "read error" on socket iostream.py
             if stream._current_request:
@@ -266,8 +287,12 @@ class KDyno(STS, HmacAuthV3HTTPHandler):
 
     @gen.engine
     def do_request(self, target, params, retry_if_invalid_stream=True, retry_on_expired_token=True, callback=None):
-        if 'verbose' in options and options.verbose > 0:
-            logging.info('request %s %s' % (target, params))
+        
+        if 'verbose' in options:
+            if options.verbose > 0:
+                logging.info('request %s %s' % (target, params))
+            elif options.verbose > 0:
+                logging.info('request %s' % (target))
         if not self.session_token:
             response = yield gen.Task( self.get_session_token, duration_seconds=3600 )
             if response.error:
@@ -303,7 +328,9 @@ class KDyno(STS, HmacAuthV3HTTPHandler):
             #request.callback = callback # we're handling error states ourselves
 
             #logging.info('writing to stream..')
+
             yield gen.Task( stream.write, towrite )
+
             if stream.error:
                 logging.error('connection died while writing to it')
                 callback( ErrorResponse('connection died while writing') )
@@ -332,16 +359,27 @@ class KDyno(STS, HmacAuthV3HTTPHandler):
             request.callback = None
             stream._current_request = None
             response = JSONResponse( code, headers, body )
+            if 'ConsumedCapacityUnits' in response.attributes:
+                self.register_usage( target, response.attributes['ConsumedCapacityUnits'] )
             if 'verbose' in options and options.verbose > 1 and code == 200:
                 logging.info('got response :%s, %s' % (response, response.attributes))
 
-            if code == 400 and response.attributes and '__type' in response.attributes and response.attributes['__type'].endswith('ExpiredTokenException'):
+
+            if code == 400 and response.attributes and '__type' in response.attributes and response.attributes['__type'].endswith('ProvisionedThroughputExceededException'):
+                logging.error( 'throughput exceeded' )
+                if 'TableName' in params:
+                    if self.Statsd:
+                        self.Statsd.increment('dynamo.throughput_exceeded.%s' % params['TableName'])
+
+            elif code == 400 and response.attributes and '__type' in response.attributes and response.attributes['__type'].endswith('ExpiredTokenException'):
                 self.session_token = None
                 # re-do this request...
                 if retry_on_expired_token:
                     result = yield gen.Task( self.do_request, target, params, retry_if_invalid_stream=True, retry_on_expired_token=False )
                     callback(result)
                     raise StopIteration
+
+                
 
             callback( response )
         else:
