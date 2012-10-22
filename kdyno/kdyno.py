@@ -219,13 +219,13 @@ class KDyno(STS, HmacAuthV3HTTPHandler):
 
     @gen.engine
     def create_table(self, name, hash_key, hash_key_type=None, range_key=None, range_key_type=None, read_units=3, write_units=5, callback=None):
-        hash_key_type = 'S' or hash_key_type
+        hash_key_type = hash_key_type or 'S'
 
         data = { 'TableName': name,
                  'KeySchema': { 'HashKeyElement': { 'AttributeName': hash_key, 'AttributeType': hash_key_type } },
                  'ProvisionedThroughput': { 'ReadCapacityUnits': read_units, 'WriteCapacityUnits': write_units } }
 
-        range_key_type = 'S' or range_key_type
+        range_key_type = range_key_type or 'S'
         if range_key:
             data['KeySchema']['RangeKeyElement'] = { 'AttributeName': range_key, 'AttributeType': range_key_type }
 
@@ -254,12 +254,12 @@ class KDyno(STS, HmacAuthV3HTTPHandler):
 
     @gen.engine
     def get_item(self, table_name, hash_key, hash_key_type=None, range_key=None, range_key_type=None, attrs=None, consistent=False, callback=None):
-        hash_key_type = 'S' or hash_key_type
+        hash_key_type = hash_key_type or 'S'
         data = { 'TableName': table_name,
                  'Key': { 'HashKeyElement': { hash_key_type: hash_key } }
                  }
         if range_key:
-            range_key_type = 'S' or range_key_type
+            range_key_type = range_key_type or 'S'
             data['Key']['RangeKeyElement'] = { range_key_type: range_key }
         if consistent:
             data['ConsistentRead'] = consistent
@@ -276,6 +276,29 @@ class KDyno(STS, HmacAuthV3HTTPHandler):
             data['Expected'] = expected
         resp = yield gen.Task( self.do_request, 'PutItem', data )
         callback(resp)
+
+    @gen.engine
+    def query(self, table_name, hash_key_value, range_key_conditions=None,
+              attributes_to_get=None, limit=None, consistent_read=False,
+              scan_index_forward=True, exclusive_start_key=None,
+              callback=None):
+        data = {'TableName': table_name,
+                'HashKeyValue': hash_key_value}
+        if range_key_conditions:
+            data['RangeKeyCondition'] = range_key_conditions
+        if attributes_to_get:
+            data['AttributesToGet'] = attributes_to_get
+        if limit:
+            data['Limit'] = limit
+        if consistent_read:
+            data['ConsistentRead'] = True
+        if scan_index_forward:
+            data['ScanIndexForward'] = True
+        else:
+            data['ScanIndexForward'] = False
+        if exclusive_start_key:
+            data['ExclusiveStartKey'] = exclusive_start_key
+        self.do_request( 'Query', data, callback=callback )
 
     @gen.engine
     def delete_item(self, table_name, key, expected=None, callback=None):
